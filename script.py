@@ -21,6 +21,16 @@ def suggest_n_hidden(input_dim: int) -> int:
         return min(2.5 * input_dim, 256)
 
 
+T0_DEFAULTS = {"ALD": 0.5, "Norm": -1.0, "Logistic": -1.0, "LogNorm": 0.1, "Weibull": 0.1, "Exp": 2.0}
+
+
+def default_t0(model_str: str) -> float:
+    base = model_str.replace("_Classifier", "").replace("MMD", "")
+    if base.startswith("IC"):
+        base = base[2:]
+    return T0_DEFAULTS.get(base, 0.0)
+
+
 def train_and_evaluate(
     dataset_str: str,
     model_str: str = "ALD_Classifier",
@@ -28,7 +38,7 @@ def train_and_evaluate(
     batch_size: int = 256,
     lr: float = 1e-3,          
     num_runs: int = 5,
-    lambda_reg: float = 0.9,   
+    beta: float = 0.1,
     t: float = 1.0,
     # MMD/KCE hyperparams (only used for *_MMD models)
     lambda_kce: float = 0.1,   # weight of KCE(MMD) regularizer
@@ -122,8 +132,8 @@ def train_and_evaluate(
             loss_val = None
 
             arg_candidates = [
-                (x_batch, y_batch.view(-1), q_local, lambda_reg, t),
-                (x_batch, y_batch.view(-1), q_local, lambda_reg),
+                (x_batch, y_batch.view(-1), q_local, beta, t),
+                (x_batch, y_batch.view(-1), q_local, beta),
                 (x_batch, y_batch.view(-1), t),
                 (x_batch, y_batch.view(-1),),
             ]
@@ -172,7 +182,7 @@ def train_and_evaluate(
             y_test_all = []
             
             with torch.no_grad():
-                for x_test, y_test in data_module.test_dataloader():
+                for x_test, y_test in data_module.val_dataloader():
                     dev = next(model.parameters()).device
                     x_test = x_test.to(dev)
                     y_test = y_test.to(dev)
@@ -221,7 +231,7 @@ def train_and_evaluate(
                 print(
                     f"Run {run+1} | Ep {epoch+1}/{epochs} "
                     f"| TrLoss: {mean_train_loss:.4f} "
-                    f"| TeLoss: {mean_test_loss:.4f} "
+                    f"| VaLoss: {mean_test_loss:.4f} "
                     f"| Acc: {acc:.4f} | ECE: {ece:.4f} | KCE: {kce:.4f}" 
                 )
 
@@ -268,7 +278,7 @@ def train_and_evaluate(
         epochs_arr = np.arange(1, len(train_hist) + 1)
         plt.figure(figsize=(6, 4))
         plt.plot(epochs_arr, train_hist, label=f"Train Loss (run {i+1})")
-        plt.plot(epochs_arr, test_hist, label=f"Test Loss (run {i+1})")
+        plt.plot(epochs_arr, test_hist, label=f"Val Loss (run {i+1})")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.title(f"{model_str} on {dataset_str} (run {i+1})")
@@ -365,7 +375,7 @@ if __name__ == "__main__":
                     num_runs=5,          
                     lambda_kce=0.1, 
                     sigma2_z=None,  
-                    t=2,
+                    t=default_t0(model_name),
                     early_stop=True,
                     patience=50,
                     lr=1e-3,
