@@ -110,20 +110,13 @@ def _compute_ece_torchmetrics(probs: torch.Tensor,
     Compute Top-label ECE with torchmetrics.CalibrationError.
     """
     num_classes = probs.shape[1]
-    task_type = 'binary' if num_classes == 2 else 'multiclass'
-
-    if task_type == 'binary':
-        preds_for_ece = probs[:, 1]  # prob of positive class
-    else:
-        preds_for_ece = probs        # full distribution [N, C]
-
     metric = CalibrationError(
         n_bins=num_bins,
         norm='l1',
-        task=task_type,
+        task='multiclass',
         num_classes=num_classes
     )
-    metric.update(preds=preds_for_ece, target=labels.view(-1))
+    metric.update(preds=probs, target=labels.view(-1))
     return float(metric.compute().item())
 
 
@@ -145,8 +138,8 @@ def _group_masks_by_X(x: torch.Tensor,
 
     med = torch.median(x, dim=0).values  # [n]
 
-    lo = int(max(1, lower_frac * N))
-    hi = int(min(N, upper_frac * N))
+    lo = max(1, math.ceil(lower_frac * N))
+    hi = min(N, math.floor(upper_frac * N))
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -266,16 +259,13 @@ def evaluate(model_str, model, x_test_torch, y_test_torch,
 
         # Global ECE
         num_classes = probs.shape[1]
-        task_type = 'binary' if num_classes == 2 else 'multiclass'
-        preds_for_ece = probs[:, 1] if task_type == 'binary' else probs
-
         ece_metric = CalibrationError(
             n_bins=num_bins,
             norm='l1',
-            task=task_type,
+            task='multiclass',
             num_classes=num_classes
         )
-        ece_metric.update(preds=preds_for_ece, target=y_test_torch)
+        ece_metric.update(preds=probs, target=y_test_torch)
         ece = ece_metric.compute().item()
 
 
