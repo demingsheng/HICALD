@@ -46,36 +46,13 @@ def compute_neurips2023_kce_loss(
         sigma2_z = _median_heuristic(features)
     K_zz = _rbf_kernel_matrix(features, features, sigma2_z)
 
-    # 2. Prepare Label Kernel (K_YY)
-    # We use RBF on the One-Hot vs Probs representation.
     y_onehot = F.one_hot(y_true.long(), num_classes=C).float()
-    
-    # Calculate a common sigma for the label space using median heuristic on the union
-    with torch.no_grad():
-        y_all = torch.cat([y_onehot, probs], dim=0)
-        sigma2_y = _median_heuristic(y_all)
-        
-    def k_y_func(a, b):
-        return _rbf_kernel_matrix(a, b, sigma2_y)
-
-    # Term 1: Real-Real (OneHot vs OneHot)
-    K_yy_target = k_y_func(y_onehot, y_onehot)
-    
-    # Term 2: Pred-Pred (Probs vs Probs)
-    K_yy_pred = k_y_func(probs, probs)
-    
-    # Term 3: Cross (OneHot vs Probs)
-    K_yy_cross = k_y_func(y_onehot, probs)
-
-    # 3. Compute MMD^2 (V-statistic for stability)
-    term_target = (K_yy_target * K_zz).mean()
-    term_pred = (K_yy_pred * K_zz).mean()
-    term_cross = (K_yy_cross * K_zz).mean()
-    
-    loss_kce = term_target + term_pred - 2 * term_cross
-    
-    # Ensure non-negative output
-    return F.relu(loss_kce)
+    K_yy_target = y_onehot @ y_onehot.T
+    K_yy_pred = probs @ probs.T
+    K_yy_cross = y_onehot @ probs.T
+    H = (K_yy_target + K_yy_pred - K_yy_cross - K_yy_cross.T) * K_zz
+    off_diag = ~torch.eye(B, dtype=torch.bool, device=probs.device)
+    return H[off_diag].sum() / (B * (B - 1))
 
 
 # ================================================================
@@ -126,7 +103,7 @@ class SoftmaxMMD_Classifier(Softmax_Classifier):
         # 3. KCE (MMD) Loss
         # USE LOGITS AS FEATURES Z
         kce = compute_neurips2023_kce_loss(
-            y_true=y, probs=probs, features=logits, sigma2_z=sigma2_z
+            y_true=y, probs=probs, features=probs, sigma2_z=sigma2_z
         )
         
         loss = loss_nll + lambda_kce * kce
@@ -172,7 +149,7 @@ class ICSoftmax_Classifier(nn.Module):
         x_feat = self.extract_features(x)
         return self.predict_from_features(x_feat, q, return_probs)
 
-    def loss_icsoftmax_classifier(self, x, y, q_unused, lambda_reg=0.9, t=0.0):
+    def loss_icsoftmax_classifier(self, x, y, q_unused, beta=0.1, t=0.0):
         # 1. Classification (Gradient Flowing)
         q_clean = torch.ones(x.shape[0], 1, device=x.device)
         probs_clean = self.forward(x, q=q_clean, return_probs=True, t=t)
@@ -191,7 +168,7 @@ class ICSoftmax_Classifier(nn.Module):
         confidences_aug, _ = torch.max(probs_aug, dim=1)
         loss_cal = torch.mean(torch.abs(confidences_aug - q_aug.view(-1)))
 
-        return lambda_reg * loss_nll + (1 - lambda_reg) * loss_cal
+        return loss_nll + beta * loss_cal
 
 
 # ================================================================
@@ -264,8 +241,7 @@ class ALDMMD_Classifier(ALD_Classifier):
         
         # 3. KCE (MMD)
         # USE RAW PARAMETERS AS FEATURES Z (More informative than probs)
-        features = torch.cat([theta, sigma, kappa], dim=1)
-        kce = compute_neurips2023_kce_loss(y, probs, features, sigma2_z)
+        kce = compute_neurips2023_kce_loss(y, probs, probs, sigma2_z)
         
         loss = loss_nll + lambda_kce * kce
         return loss, {"nll": loss_nll.detach(), "kce": kce.detach()}
@@ -293,7 +269,9 @@ class ICALD_Classifier(nn.Module):
 
     def extract_features(self, x):
         res = self.projection(x)
-        return torch.relu(self.layer1(x)) + res
+        x_feat = torch.relu(self.layer1(x)) + res
+        if self.is_dropout: x_feat = self.dropout(x_feat)
+        return x_feat
 
     def predict_from_features(self, features, q, return_probs=False, t=0.0):
         q_emb = torch.exp(self.layer2_q(torch.relu(self.layer1_q(q))))
@@ -330,7 +308,7 @@ class ICALD_Classifier(nn.Module):
         cdf = torch.where(cond, 1 - 1/(1+kappa**2)*exp1, kappa**2/(1+kappa**2)*exp2).clamp(1e-6, 1-1e-6)
         return cdf / (cdf.sum(1, keepdim=True) + 1e-8)
 
-    def loss_icald_classifier(self, x, y, q_unused=None, lambda_reg=0.9, t=0.0):
+    def loss_icald_classifier(self, x, y, q_unused=None, beta=0.1, t=0.0):
         q_clean = torch.ones(x.shape[0], 1, device=x.device)
         probs_clean = self.forward(x, q=q_clean, return_probs=True, t=t)
         loss_nll = F.nll_loss((probs_clean+1e-8).log(), y)
@@ -347,7 +325,7 @@ class ICALD_Classifier(nn.Module):
         conf, _ = probs_aug.max(1)
         loss_cal = (conf - q_aug.view(-1)).abs().mean()
 
-        return lambda_reg * loss_nll + (1 - lambda_reg) * loss_cal
+        return loss_nll + beta * loss_cal
 
 
 # ================================================================
@@ -370,8 +348,8 @@ class Norm_Classifier(nn.Module):
         x = torch.relu(self.layer1(x)) + res
         if self.is_dropout: x = self.dropout(x)
         
-        mu = self.layer3_mu(torch.relu(self.layer2_mu(x)))
-        sigma = torch.exp(self.layer3_sigma(torch.relu(self.layer2_sigma(x))).clamp(-9, 10))
+        mu = self.layer3_mu(self.dropout(torch.relu(self.layer2_mu(x))))
+        sigma = torch.exp(self.layer3_sigma(self.dropout(torch.relu(self.layer2_sigma(x)))).clamp(-9, 10))
         
         if return_probs: return self.norm_probs(mu, sigma, t)
         return mu, sigma
@@ -393,8 +371,7 @@ class NormMMD_Classifier(Norm_Classifier):
         mu, sigma = self.forward(x, return_probs=False)
         probs = self.norm_probs(mu, sigma, t)
         loss_nll = F.nll_loss((probs+1e-8).log(), y)
-        features = torch.cat([mu, sigma], dim=1)
-        kce = compute_neurips2023_kce_loss(y, probs, features, sigma2_z)
+        kce = compute_neurips2023_kce_loss(y, probs, probs, sigma2_z)
         return loss_nll + lambda_kce * kce, {"nll": loss_nll.detach(), "kce": kce.detach()}
 
 
@@ -415,7 +392,7 @@ class Exp_Classifier(nn.Module):
         res = self.projection(x)
         x = torch.relu(self.layer1(x)) + res
         if self.is_dropout: x = self.dropout(x)
-        lam = torch.exp(self.layer3_lam(torch.relu(self.layer2_lam(x))).clamp(-9, 10))
+        lam = torch.exp(self.layer3_lam(self.dropout(torch.relu(self.layer2_lam(x)))).clamp(-9, 10))
         if return_probs: return self.exp_probs(lam, t)
         return lam
 
@@ -448,8 +425,8 @@ class Weibull_Classifier(nn.Module):
         res = self.projection(x)
         x = torch.relu(self.layer1(x)) + res
         if self.is_dropout: x = self.dropout(x)
-        k = F.softplus(self.layer3_k(torch.relu(self.layer2_k(x)))).clamp(1e-3, 10)
-        lam = F.softplus(self.layer3_lam(torch.relu(self.layer2_lam(x)))).clamp(1e-3, 10)
+        k = F.softplus(self.layer3_k(self.dropout(torch.relu(self.layer2_k(x))))).clamp(1e-3, 10)
+        lam = F.softplus(self.layer3_lam(self.dropout(torch.relu(self.layer2_lam(x))))).clamp(1e-3, 10)
         if return_probs: return self.weibull_probs(k, lam, t)
         return k, lam
 
@@ -555,8 +532,8 @@ class Logistic_Classifier(nn.Module):
         res = self.projection(x)
         x = torch.relu(self.layer1(x)) + res
         if self.is_dropout: x = self.dropout(x)
-        mu = self.layer3_mu(torch.relu(self.layer2_mu(x)))
-        s = torch.exp(self.layer3_s(torch.relu(self.layer2_s(x))).clamp(-9, 10))
+        mu = self.layer3_mu(self.dropout(torch.relu(self.layer2_mu(x))))
+        s = torch.exp(self.layer3_s(self.dropout(torch.relu(self.layer2_s(x)))).clamp(-9, 10))
         if return_probs: return self.logistic_probs(mu, s, t)
         return mu, s
 
@@ -574,7 +551,6 @@ class LogisticMMD_Classifier(Logistic_Classifier):
         mu, s = self.forward(x, return_probs=False)
         probs = self.logistic_probs(mu, s, t)
         loss_nll = F.nll_loss((probs+1e-8).log(), y)
-        features = torch.cat([mu, s], dim=1)
-        kce = compute_neurips2023_kce_loss(y, probs, features, sigma2_z)
+        kce = compute_neurips2023_kce_loss(y, probs, probs, sigma2_z)
         return loss_nll + lambda_kce * kce, {"nll": loss_nll.detach(), "kce": kce.detach()}
 
